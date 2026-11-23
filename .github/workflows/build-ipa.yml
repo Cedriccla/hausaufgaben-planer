@@ -1,0 +1,43 @@
+name: iPad-App bauen (.ipa)
+
+on:
+  push:
+    paths:
+      - "ios/**"
+      - ".github/workflows/build-ipa.yml"
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: XcodeGen installieren
+        run: brew install xcodegen
+
+      - name: Xcode-Projekt erzeugen
+        working-directory: ios
+        run: xcodegen generate
+
+      - name: App bauen (ohne Signatur – Sideloadly signiert sie)
+        working-directory: ios
+        run: |
+          xcodebuild -project Hausaufgaben.xcodeproj -target Hausaufgaben \
+            -configuration Release -sdk iphoneos \
+            SYMROOT="$PWD/build" \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
+            build
+
+      - name: .ipa packen
+        working-directory: ios
+        run: |
+          rm -rf Payload && mkdir Payload
+          cp -R build/Release-iphoneos/Hausaufgaben.app Payload/
+          zip -qry Hausaufgaben.ipa Payload
+          ls -la Hausaufgaben.ipa
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Hausaufgaben-ipa
+          path: ios/Hausaufgaben.ipa
