@@ -1,5 +1,11 @@
 import SwiftUI
 
+enum UntisLoginMode: String, CaseIterable, Identifiable {
+    case password = "Untis-Passwort"
+    case secret = "Schulaccount"
+    var id: String { rawValue }
+}
+
 struct UntisView: View {
     @EnvironmentObject var store: HomeworkStore
     @EnvironmentObject var untis: UntisSync
@@ -11,6 +17,8 @@ struct UntisView: View {
     @State private var password = ""
     @State private var searching = false
     @State private var searchMessage = ""
+    @State private var mode: UntisLoginMode = .secret
+    @State private var qrLink = ""
 
     var body: some View {
         NavigationStack {
@@ -63,6 +71,58 @@ struct UntisView: View {
     @ViewBuilder
     private var loginSections: some View {
         Section {
+            Picker("Anmeldung", selection: $mode) {
+                ForEach(UntisLoginMode.allCases) { m in Text(m.rawValue).tag(m) }
+            }
+            .pickerStyle(.segmented)
+        } header: {
+            Text("Wie meldest du dich bei Untis an?")
+        } footer: {
+            Text(mode == .secret
+                 ? "Für Schulen, bei denen du dich mit einem Schulaccount anmeldest. Du brauchst den Schlüssel aus WebUntis: Profil → Freigaben → Zugriff über Untis Mobile → Anzeigen."
+                 : "Wenn du für Untis einen eigenen Benutzernamen und ein Passwort hast.")
+        }
+
+        if mode == .secret {
+            Section {
+                TextField("untis://setschool?…", text: $qrLink, axis: .vertical)
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
+                    .lineLimit(1...4)
+                if let qr = UntisQRData(link: qrLink) {
+                    LabeledContent("Schule", value: qr.school.loginName)
+                    LabeledContent("Benutzer", value: qr.user)
+                    Button {
+                        Task {
+                            await untis.login(school: qr.school, user: qr.user,
+                                              credential: .secret(qr.key), store: store)
+                            if untis.isLoggedIn { qrLink = "" }
+                        }
+                    } label: {
+                        HStack {
+                            Text("Anmelden und Hausaufgaben laden")
+                            if untis.isBusy { Spacer(); ProgressView() }
+                        }
+                    }
+                    .disabled(untis.isBusy)
+                } else if !qrLink.isEmpty {
+                    Text("Das ist kein gültiger Untis-Link.").foregroundColor(.red)
+                }
+            } header: {
+                Text("Weg A: Link aus dem QR-Code einfügen")
+            } footer: {
+                Text("Wenn du den Link aus dem QR-Code kopieren kannst, füge ihn hier ein. Sonst nimm Weg B darunter.")
+            }
+        }
+
+        if mode == .password || UntisQRData(link: qrLink) == nil {
+            schoolSearchSection
+        }
+    }
+
+    @ViewBuilder
+    private var schoolSearchSection: some View {
+        Section {
             HStack {
                 TextField("Name oder Ort der Schule", text: $query)
                     .autocorrectionDisabled()
@@ -96,7 +156,7 @@ struct UntisView: View {
                 }
             }
         } header: {
-            Text("1. Schule suchen")
+            Text(mode == .secret ? "Weg B: 1. Schule suchen" : "1. Schule suchen")
         }
 
         if let school = picked {
@@ -104,11 +164,17 @@ struct UntisView: View {
                 TextField("Benutzername", text: $user)
                     .textInputAutocapitalization(.never)
                     .autocorrectionDisabled()
-                SecureField("Passwort", text: $password)
+                SecureField(mode == .secret ? "Schlüssel (aus WebUntis)" : "Passwort", text: $password)
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
                 Button {
                     Task {
-                        await untis.login(school: school, user: user.trimmingCharacters(in: .whitespaces),
-                                          password: password, store: store)
+                        let cleaned = user.trimmingCharacters(in: .whitespaces)
+                        let credential: UntisCredential = mode == .secret
+                            ? .secret(password.replacingOccurrences(of: " ", with: ""))
+                            : .password(password)
+                        await untis.login(school: school, user: cleaned,
+                                          credential: credential, store: store)
                         if untis.isLoggedIn { password = "" }
                     }
                 } label: {
@@ -121,7 +187,9 @@ struct UntisView: View {
             } header: {
                 Text("2. Bei \(school.displayName) anmelden")
             } footer: {
-                Text("Das sind dieselben Daten wie in der Untis-App. Dein Passwort bleibt sicher im Schlüsselbund deines iPads.")
+                Text(mode == .secret
+                     ? "Benutzername und Schlüssel stehen in WebUntis unter Profil → Freigaben → Anzeigen. Der Schlüssel bleibt sicher im Schlüsselbund deines iPads."
+                     : "Das sind dieselben Daten wie in der Untis-App. Dein Passwort bleibt sicher im Schlüsselbund deines iPads.")
             }
         }
     }

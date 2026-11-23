@@ -1,4 +1,5 @@
 import Foundation
+import CryptoKit
 import Security
 import SwiftUI
 
@@ -18,6 +19,37 @@ struct UntisHomework {
     let text: String
     let due: Date
     let completed: Bool
+}
+
+/// Wie man sich anmeldet: mit Untis-Passwort oder mit dem Schlüssel aus dem QR-Code
+/// (für Schulen, bei denen man sich mit einem Schulaccount anmeldet)
+enum UntisCredential {
+    case password(String)
+    case secret(String)
+}
+
+/// Inhalt des QR-Codes aus WebUntis (Profil → Freigaben → Untis Mobile)
+struct UntisQRData {
+    var school: UntisSchool
+    var user: String
+    var key: String
+
+    /// Liest einen Link wie untis://setschool?url=xyz.webuntis.com&school=ABC&user=name&key=SECRET
+    init?(link: String) {
+        let text = link.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let comps = URLComponents(string: text) else { return nil }
+        var values: [String: String] = [:]
+        for item in comps.queryItems ?? [] { values[item.name.lowercased()] = item.value ?? "" }
+        guard var server = values["url"], let school = values["school"],
+              let user = values["user"], let key = values["key"],
+              !server.isEmpty, !school.isEmpty, !user.isEmpty, !key.isEmpty else { return nil }
+        server = server.replacingOccurrences(of: "https://", with: "")
+            .replacingOccurrences(of: "http://", with: "")
+        if let slash = server.firstIndex(of: "/") { server = String(server[..<slash]) }
+        self.school = UntisSchool(server: server, loginName: school, displayName: school, address: "")
+        self.user = user
+        self.key = key
+    }
 }
 
 struct UntisError: LocalizedError {
@@ -99,12 +131,65 @@ enum UntisAPI {
         return c.url!
     }
 
-    /// Anmelden, Hausaufgaben laden, wieder abmelden
-    static func fetchHomework(school: UntisSchool, user: String, password: String) async throws -> [UntisHomework] {
+    /// Anmelden mit Passwort → Sitzungs-ID
+    private static func loginWithPassword(school: UntisSchool, user: String, password: String) async throws -> String {
         let auth = try await rpc(rpcURL(school), method: "authenticate",
                                  params: ["user": user, "password": password, "client": "Hausaufgaben"])
         guard let sessionId = (auth as? [String: Any])?["sessionId"] as? String else {
             throw UntisError(message: "Anmeldung bei Untis fehlgeschlagen.")
+        }
+        return sessionId
+    }
+
+    /// Anmelden mit dem Schlüssel aus dem QR-Code (so wie die Untis-App) → Sitzungs-ID
+    private static func loginWithSecret(school: UntisSchool, user: String, secret: String) async throws -> String {
+        guard let otp = TOTP.code(secret: secret) else {
+            throw UntisError(message: "Der Schlüssel ist ungültig. Bitte genau so abtippen, wie er in WebUntis steht.")
+        }
+        var c = URLComponents()
+        c.scheme = "https"
+        c.host = school.server
+        c.path = "/WebUntis/jsonrpc_intern.do"
+        c.queryItems = [URLQueryItem(name: "m", value: "getUserData2017"),
+                        URLQueryItem(name: "school", value: school.loginName),
+                        URLQueryItem(name: "v", value: "i2.2")]
+        var request = URLRequest(url: c.url!)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        let clientTime = Int64(Date().timeIntervalSince1970 * 1000)
+        let body: [String: Any] = [
+            "id": "1", "method": "getUserData2017", "jsonrpc": "2.0",
+            "params": [["auth": ["clientTime": clientTime, "user": user, "otp": otp]]]
+        ]
+        request.httpBody = try JSONSerialization.data(withJSONObject: body)
+
+        let (data, response) = try await send(request)
+        if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+           let err = json["error"] as? [String: Any] {
+            let code = err["code"] as? Int ?? 0
+            if code == -8504 || code == -8520 {
+                throw UntisError(message: "Benutzername oder Schlüssel stimmt nicht. Prüfe auch, ob die Uhrzeit auf dem iPad stimmt.")
+            }
+            throw UntisError(message: "Untis-Fehler: \(err["message"] as? String ?? "unbekannt")")
+        }
+        let setCookie = (response as? HTTPURLResponse)?.value(forHTTPHeaderField: "Set-Cookie") ?? ""
+        guard let range = setCookie.range(of: "JSESSIONID=") else {
+            throw UntisError(message: "Anmeldung bei Untis fehlgeschlagen.")
+        }
+        let rest = setCookie[range.upperBound...]
+        let sessionId = String(rest.prefix { $0 != ";" && $0 != "," && $0 != " " })
+        guard !sessionId.isEmpty else { throw UntisError(message: "Anmeldung bei Untis fehlgeschlagen.") }
+        return sessionId
+    }
+
+    /// Anmelden, Hausaufgaben laden, wieder abmelden
+    static func fetchHomework(school: UntisSchool, user: String, credential: UntisCredential) async throws -> [UntisHomework] {
+        let sessionId: String
+        switch credential {
+        case .password(let password):
+            sessionId = try await loginWithPassword(school: school, user: user, password: password)
+        case .secret(let secret):
+            sessionId = try await loginWithSecret(school: school, user: user, secret: secret)
         }
         let sessionCookie = makeCookie(sessionId: sessionId, school: school)
         let logoutURL = rpcURL(school)
@@ -171,6 +256,42 @@ enum UntisAPI {
     }
 }
 
+// MARK: - Einmal-Code aus dem Schlüssel (TOTP, wie Google Authenticator)
+
+enum TOTP {
+    static func code(secret: String, time: Date = Date()) -> String? {
+        guard let key = base32Decode(secret), !key.isEmpty else { return nil }
+        var counter = UInt64(time.timeIntervalSince1970 / 30).bigEndian
+        let message = withUnsafeBytes(of: &counter) { Data($0) }
+        let mac = Array(HMAC<Insecure.SHA1>.authenticationCode(for: message, using: SymmetricKey(data: key)))
+        let offset = Int(mac[mac.count - 1] & 0x0f)
+        let value = (UInt32(mac[offset] & 0x7f) << 24)
+            | (UInt32(mac[offset + 1]) << 16)
+            | (UInt32(mac[offset + 2]) << 8)
+            | UInt32(mac[offset + 3])
+        return String(format: "%06d", value % 1_000_000)
+    }
+
+    static func base32Decode(_ text: String) -> Data? {
+        let alphabet = Array("ABCDEFGHIJKLMNOPQRSTUVWXYZ234567")
+        var lookup: [Character: UInt32] = [:]
+        for (i, ch) in alphabet.enumerated() { lookup[ch] = UInt32(i) }
+        var buffer: UInt32 = 0
+        var bits = 0
+        var out = Data()
+        for ch in text.uppercased() where ch != " " && ch != "=" && ch != "-" {
+            guard let v = lookup[ch] else { return nil }
+            buffer = (buffer << 5) | v
+            bits += 5
+            if bits >= 8 {
+                bits -= 8
+                out.append(UInt8((buffer >> UInt32(bits)) & 0xff))
+            }
+        }
+        return out
+    }
+}
+
 // MARK: - Passwort sicher im Schlüsselbund speichern
 
 enum Keychain {
@@ -228,19 +349,32 @@ final class UntisSync: ObservableObject {
         school != nil && !username.isEmpty && Keychain.get("password") != nil
     }
 
+    /// Gespeicherte Anmeldedaten (Passwort oder QR-Schlüssel)
+    private var storedCredential: UntisCredential? {
+        guard let value = Keychain.get("password") else { return nil }
+        return defaults.string(forKey: "untis.mode") == "secret" ? .secret(value) : .password(value)
+    }
+
     /// Erstes Anmelden: Daten nur speichern, wenn der Login klappt
     @MainActor
-    func login(school: UntisSchool, user: String, password: String, store: HomeworkStore) async {
+    func login(school: UntisSchool, user: String, credential: UntisCredential, store: HomeworkStore) async {
         isBusy = true
         status = "Melde an …"
         defer { isBusy = false }
         do {
-            let list = try await UntisAPI.fetchHomework(school: school, user: user, password: password)
+            let list = try await UntisAPI.fetchHomework(school: school, user: user, credential: credential)
             self.school = school
             self.username = user
             defaults.set(try? JSONEncoder().encode(school), forKey: "untis.school")
             defaults.set(user, forKey: "untis.user")
-            Keychain.set(password, for: "password")
+            switch credential {
+            case .password(let password):
+                Keychain.set(password, for: "password")
+                defaults.set("password", forKey: "untis.mode")
+            case .secret(let secret):
+                Keychain.set(secret, for: "password")
+                defaults.set("secret", forKey: "untis.mode")
+            }
             finish(list, store: store)
         } catch {
             status = error.localizedDescription
@@ -249,12 +383,12 @@ final class UntisSync: ObservableObject {
 
     @MainActor
     func sync(store: HomeworkStore) async {
-        guard let school = school, let password = Keychain.get("password"), !isBusy else { return }
+        guard let school = school, let credential = storedCredential, !isBusy else { return }
         isBusy = true
         status = "Lade Hausaufgaben …"
         defer { isBusy = false }
         do {
-            let list = try await UntisAPI.fetchHomework(school: school, user: username, password: password)
+            let list = try await UntisAPI.fetchHomework(school: school, user: username, credential: credential)
             finish(list, store: store)
         } catch {
             status = error.localizedDescription
@@ -286,6 +420,7 @@ final class UntisSync: ObservableObject {
         defaults.removeObject(forKey: "untis.school")
         defaults.removeObject(forKey: "untis.user")
         defaults.removeObject(forKey: "untis.lastSync")
+        defaults.removeObject(forKey: "untis.mode")
         school = nil
         username = ""
         lastSync = nil
