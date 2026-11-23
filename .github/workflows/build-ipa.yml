@@ -7,6 +7,9 @@ on:
       - ".github/workflows/build-ipa.yml"
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: macos-15-intel  # Intel-Mac: die ARM-Macs waren dauerhaft ausgelastet
@@ -41,3 +44,14 @@ jobs:
         with:
           name: Hausaufgaben-ipa
           path: ios/Hausaufgaben.ipa
+
+      - name: Als Download unter "Releases" bereitstellen
+        if: github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete app --yes --cleanup-tag || true
+          gh release create app ios/Hausaufgaben.ipa \
+            --title "iPad-App (neueste Version)" \
+            --notes "Hausaufgaben.ipa herunterladen und in Sideloadly ziehen." \
+            --latest

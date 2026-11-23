@@ -7,7 +7,8 @@ Selbst programmierter Hausaufgaben-Planer fürs iPad: Aufgaben eintragen, Wochen
 - `docs/` – Web-Version (PWA) mit Untis-Stundenplan-Import, über GitHub Pages nutzbar.
 
 ## .ipa bauen
-Unter **Actions → „iPad-App bauen (.ipa)“ → Run workflow**. Die fertige Datei liegt danach beim Lauf unter „Artifacts“.
+Passiert automatisch bei jeder Änderung in `ios/` (oder per **Actions → „iPad-App bauen (.ipa)“ → Run workflow**).
+Die neueste Datei gibt es immer hier: [Hausaufgaben.ipa herunterladen](https://github.com/Cedriccla/hausaufgaben-planer/releases/latest/download/Hausaufgaben.ipa)
 
 ## Mit Sideloadly installieren
 1. Sideloadly (sideloadly.io) und iTunes (Windows) installieren.
